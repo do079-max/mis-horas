@@ -14,6 +14,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   :root{
     --night:#0F1320;
@@ -302,6 +303,60 @@
   }
   .install-banner.show{ display:block; }
   .install-banner b{ color:var(--cream); }
+
+  .drive-card{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:18px;
+    padding:16px 18px;
+    margin-bottom:18px;
+  }
+  .drive-card .drive-title{
+    font-size:13px;
+    font-weight:700;
+    color:var(--cream);
+    margin:0 0 3px;
+    display:flex;
+    align-items:center;
+    gap:6px;
+  }
+  .drive-card .drive-sub{
+    font-size:12px;
+    color:var(--muted);
+    margin:0 0 12px;
+  }
+  .drive-dot{
+    width:7px; height:7px;
+    border-radius:50%;
+    background:var(--muted);
+    display:inline-block;
+  }
+  .drive-dot.on{ background:var(--green); }
+  .drive-actions{
+    display:flex;
+    gap:10px;
+  }
+  .btn-drive{
+    flex:1;
+    padding:11px;
+    border-radius:11px;
+    font-family:'Inter',sans-serif;
+    font-size:13px;
+    font-weight:600;
+    cursor:pointer;
+    text-align:center;
+  }
+  .btn-drive.primary{
+    background:var(--amber);
+    color:#1A0E03;
+    border:none;
+  }
+  .btn-drive.secondary{
+    background:transparent;
+    color:var(--cream);
+    border:1.5px solid rgba(244,239,230,0.2);
+  }
+  .btn-drive:disabled{ opacity:0.5; }
 </style>
 </head>
 <body>
@@ -327,6 +382,15 @@
     <div class="target-row">
       <label for="targetInput">Meta por bloque (horas)</label>
       <input type="number" id="targetInput" min="0.5" step="0.5" value="4">
+    </div>
+  </div>
+
+  <div class="drive-card">
+    <p class="drive-title"><span class="drive-dot" id="driveDot"></span> Respaldo en Google Drive</p>
+    <p class="drive-sub" id="driveStatus">No conectado todavía</p>
+    <div class="drive-actions">
+      <button class="btn-drive primary" id="driveConnectBtn">Conectar Drive</button>
+      <button class="btn-drive secondary" id="driveRestoreBtn" style="display:none;">Restaurar</button>
     </div>
   </div>
 
@@ -370,6 +434,10 @@
   var manualForm = document.getElementById('manualForm');
   var manSave = document.getElementById('manSave');
   var installBanner = document.getElementById('installBanner');
+  var driveDot = document.getElementById('driveDot');
+  var driveStatus = document.getElementById('driveStatus');
+  var driveConnectBtn = document.getElementById('driveConnectBtn');
+  var driveRestoreBtn = document.getElementById('driveRestoreBtn');
 
   var dayNames = ['domingo','lunes','martes','miércoles','jueves','viernes','sábado'];
   var monthNames = ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
@@ -443,6 +511,195 @@
     else storeDelete('fedex-active');
   }
   function saveTarget(){ storeSet('fedex-target', String(targetHours)); }
+
+  // --- Respaldo en Google Drive ---
+  var DRIVE_CLIENT_ID = '79251472182-rm8347ssdlvvu1bc57b2kgn7d3lh7vue.apps.googleusercontent.com';
+  var DRIVE_FILE_NAME = 'mis-horas-backup.json';
+  var driveTokenClient = null;
+  var driveAccessToken = null;
+  var driveFileId = null;
+  var driveBusy = false;
+
+  function setDriveStatus(text, connected){
+    driveStatus.textContent = text;
+    driveDot.className = 'drive-dot' + (connected ? ' on' : '');
+  }
+
+  function waitForGoogle(cb, tries){
+    tries = tries || 0;
+    if(window.google && window.google.accounts && window.google.accounts.oauth2){
+      cb();
+    }else if(tries < 50){
+      setTimeout(function(){ waitForGoogle(cb, tries+1); }, 200);
+    }else{
+      setDriveStatus('No se pudo cargar Google. Revisa tu conexión.', false);
+    }
+  }
+
+  function initDrive(){
+    driveTokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: DRIVE_CLIENT_ID,
+      scope: 'https://www.googleapis.com/auth/drive.file',
+      callback: function(){}
+    });
+    if(storeGet('fedex-drive-connected') === '1'){
+      requestDriveToken(false).then(function(){
+        driveConnectBtn.textContent = 'Reconectar';
+        driveRestoreBtn.style.display = 'block';
+        showLastBackup();
+      }).catch(function(){
+        setDriveStatus('Toca "Conectar Drive" para reactivar', false);
+      });
+    }
+  }
+
+  function requestDriveToken(interactive){
+    return new Promise(function(resolve, reject){
+      driveTokenClient.callback = function(resp){
+        if(resp && resp.access_token){
+          driveAccessToken = resp.access_token;
+          resolve(resp.access_token);
+        }else{
+          reject(resp);
+        }
+      };
+      driveTokenClient.requestAccessToken({ prompt: interactive ? 'consent' : '' });
+    });
+  }
+
+  function driveFetch(url, opts){
+    opts = opts || {};
+    opts.headers = opts.headers || {};
+    opts.headers.Authorization = 'Bearer ' + driveAccessToken;
+    return fetch(url, opts);
+  }
+
+  function findDriveFileId(){
+    if(driveFileId) return Promise.resolve(driveFileId);
+    var q = encodeURIComponent("name='"+DRIVE_FILE_NAME+"' and trashed=false");
+    return driveFetch('https://www.googleapis.com/drive/v3/files?q='+q+'&fields=files(id,name)')
+      .then(function(res){ return res.json(); })
+      .then(function(data){
+        if(data.files && data.files.length > 0){
+          driveFileId = data.files[0].id;
+          return driveFileId;
+        }
+        return null;
+      });
+  }
+
+  function createDriveFile(content){
+    var boundary = 'mishoras_boundary_314159';
+    var delimiter = "\r\n--" + boundary + "\r\n";
+    var closeDelim = "\r\n--" + boundary + "--";
+    var metadata = { name: DRIVE_FILE_NAME, mimeType: 'application/json' };
+    var body = delimiter + 'Content-Type: application/json\r\n\r\n' + JSON.stringify(metadata) +
+               delimiter + 'Content-Type: application/json\r\n\r\n' + content + closeDelim;
+    return driveFetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+      method: 'POST',
+      headers: { 'Content-Type': 'multipart/related; boundary="'+boundary+'"' },
+      body: body
+    }).then(function(res){ return res.json(); }).then(function(data){
+      driveFileId = data.id;
+      return data;
+    });
+  }
+
+  function updateDriveFile(fileId, content){
+    return driveFetch('https://www.googleapis.com/upload/drive/v3/files/'+fileId+'?uploadType=media', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: content
+    }).then(function(res){ return res.json(); });
+  }
+
+  function showLastBackup(){
+    var ts = storeGet('fedex-last-backup');
+    if(ts){
+      var d = new Date(parseInt(ts, 10));
+      setDriveStatus('Conectado · último respaldo ' + fmtTime(d.getTime()), true);
+    }else{
+      setDriveStatus('Conectado · sin respaldos todavía', true);
+    }
+  }
+
+  function backupToDrive(silent){
+    if(driveBusy) return Promise.resolve();
+    driveBusy = true;
+    if(!silent) setDriveStatus('Respaldando…', true);
+    var content = JSON.stringify({ sessions: sessions, target: targetHours, updatedAt: Date.now() });
+    return findDriveFileId().then(function(id){
+      if(id) return updateDriveFile(id, content);
+      return createDriveFile(content);
+    }).then(function(){
+      storeSet('fedex-last-backup', String(Date.now()));
+      storeSet('fedex-drive-connected', '1');
+      showLastBackup();
+      driveBusy = false;
+    }).catch(function(e){
+      console.error('Error respaldando en Drive', e);
+      setDriveStatus('No se pudo respaldar. Intenta de nuevo.', !!driveAccessToken);
+      driveBusy = false;
+    });
+  }
+
+  function maybeAutoBackup(){
+    if(storeGet('fedex-drive-connected') === '1' && driveAccessToken){
+      backupToDrive(true);
+    }
+  }
+
+  function restoreFromDrive(){
+    setDriveStatus('Buscando respaldo…', true);
+    findDriveFileId().then(function(id){
+      if(!id){
+        setDriveStatus('No hay ningún respaldo guardado todavía', true);
+        return;
+      }
+      return driveFetch('https://www.googleapis.com/drive/v3/files/'+id+'?alt=media')
+        .then(function(res){ return res.json(); })
+        .then(function(data){
+          var ok = confirm('Esto va a remplazar tus datos actuales en este teléfono con los del respaldo de Drive. ¿Continuar?');
+          if(!ok){ showLastBackup(); return; }
+          sessions = data.sessions || [];
+          targetHours = data.target || 4;
+          targetInput.value = targetHours;
+          saveSessions();
+          saveTarget();
+          render();
+          showLastBackup();
+        });
+    }).catch(function(e){
+      console.error('Error restaurando desde Drive', e);
+      setDriveStatus('No se pudo restaurar. Intenta de nuevo.', true);
+    });
+  }
+
+  driveConnectBtn.addEventListener('click', function(){
+    if(!driveTokenClient){
+      setDriveStatus('Google todavía está cargando, espera un segundo…', false);
+      return;
+    }
+    setDriveStatus('Conectando…', false);
+    requestDriveToken(true).then(function(){
+      driveConnectBtn.textContent = 'Reconectar';
+      driveRestoreBtn.style.display = 'block';
+      return backupToDrive(false);
+    }).catch(function(e){
+      console.error('No se pudo conectar Drive', e);
+      setDriveStatus('No se pudo conectar. Intenta de nuevo.', false);
+    });
+  });
+
+  driveRestoreBtn.addEventListener('click', function(){
+    if(!driveAccessToken){
+      requestDriveToken(true).then(restoreFromDrive).catch(function(){
+        setDriveStatus('No se pudo conectar. Intenta de nuevo.', false);
+      });
+    }else{
+      restoreFromDrive();
+    }
+  });
 
   function todaysTotalMs(){
     var key = dateKey(Date.now());
@@ -518,6 +775,7 @@
         sessions = sessions.filter(function(s){ return s.id !== id; });
         saveSessions();
         render();
+        maybeAutoBackup();
       });
     });
   }
@@ -544,6 +802,7 @@
       saveSessions();
       saveActive();
       render();
+      maybeAutoBackup();
     }else{
       active = { start: Date.now() };
       saveActive();
@@ -590,6 +849,7 @@
     document.getElementById('manStart').value = '';
     document.getElementById('manEnd').value = '';
     render();
+    maybeAutoBackup();
   });
 
   // Mostrar el aviso de instalación solo si todavía no corre como app instalada
@@ -609,6 +869,7 @@
   }
 
   loadAll();
+  waitForGoogle(initDrive);
 })();
 </script>
 </body>
